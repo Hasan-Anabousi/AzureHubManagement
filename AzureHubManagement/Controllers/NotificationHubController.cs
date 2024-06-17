@@ -1,8 +1,8 @@
 ﻿using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.NotificationHubs;
 using Azure.Storage.Blobs;
 using Azure.Storage.Sas;
-using Microsoft.Azure.NotificationHubs;
 using System;
 using System.Threading.Tasks;
 using System.Net.Http;
@@ -12,6 +12,7 @@ using Newtonsoft.Json;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Web;
+using AzureHubManagement.Interfaces;
 
 namespace AzureHubManagement.Controllers
 {
@@ -20,55 +21,201 @@ namespace AzureHubManagement.Controllers
     public class NotificationHubController : ControllerBase
     {
         private readonly IConfiguration _configuration;
+        private readonly ILoggerService _logger;
 
-        public NotificationHubController(IConfiguration configuration)
+        public NotificationHubController(IConfiguration configuration, ILoggerService logger)
         {
             _configuration = configuration;
+            _logger = logger;
         }
-        //[HttpPost("import")]
-        //public async Task<IActionResult> ImportData()
-        //{
 
 
-        //    // Import this file
-        // //   await ImportData(CONNECTION_STRING, HUB_NAME, STORAGE_ACCOUNT_CONNECTIONSTRING, CONTAINER_NAME);
-
-
-        //    return Ok("1");
-        //}
-
-
-        [HttpPost("export")]
-        public async Task<IActionResult> ExportData()
+        //for a some reason the import did work unless 
+        [HttpPost("import2")]
+        public async Task<IActionResult> ImportData2()
         {
-            var NotificationHubConnectionString = _configuration["Azure:NotificationHubConnectionString"];
-            var HUB_NAME = _configuration["Azure:NotificationHubName"];
+            string CONNECTION_STRING = _configuration["Azure:NotificationHubConnectionString"];
+            string HUB_NAME = _configuration["Azure:NotificationHubName"];
+            string STORAGE_ACCOUNT_CONNECTIONSTRING = _configuration["Azure:STORAGE_ACCOUNT_CONNECTIONSTRING"];
+            string CONTAINER_NAME = _configuration["Azure:CONTAINER_NAME"];
+            //string INPUT_FILE_NAME = _configuration["LastExportedFileName"];
+            string INPUT_FILE_NAME = "";
+            var descriptions = new[]
+           {
+                new MpnsRegistrationDescription(@"http://dm2.notify.live.net/throttledthirdparty/01.00/12G9Ed13dLb5RbCii5fWzpFpAgAAAAADAQAAAAQUZm52OkJCMjg1QTg1QkZDMkUxREQFBlVTTkMwMQ"),
+                new MpnsRegistrationDescription(@"http://dm2.notify.live.net/throttledthirdparty/01.00/12G9Ed13dLb5RbCii5fWzpFpAgAAAAADAQAAAAQUZm52OkJCMjg1QTg1QkZDMjUxREQFBlVTTkMwMQ"),
+                new MpnsRegistrationDescription(@"http://dm2.notify.live.net/throttledthirdparty/01.00/12G9Ed13dLb5RbCii5fWzpFpAgAAAAADAQAAAAQUZm52OkJCMjg1QTg1QkZDMhUxREQFBlVTTkMwMQ"),
+                new MpnsRegistrationDescription(@"http://dm2.notify.live.net/throttledthirdparty/01.00/12G9Ed13dLb5RbCii5fWzpFpAgAAAAADAQAAAAQUZm52OkJCMjg1QTg1QkZDMdUxREQFBlVTTkMwMQ"),
+            };
 
-            var STORAGE_ACCOUNT_CONNECTIONSTRING = _configuration["Azure:STORAGE_ACCOUNT_CONNECTIONSTRING"];  
-            var CONTAINER_NAME = _configuration["Azure:CONTAINER_NAME"];  
+            // Get a reference to a container named "sample-container" and then create it
+            BlobContainerClient container = new BlobContainerClient(STORAGE_ACCOUNT_CONNECTIONSTRING, CONTAINER_NAME);
 
+            await container.CreateIfNotExistsAsync();
+
+            await SerializeToBlobAsync(container, descriptions, INPUT_FILE_NAME);
+
+            // TODO then create Sas
+            var outputContainerSasUri = GetOutputDirectoryUrl(container);
+
+            BlobContainerClient inputcontainer = new BlobContainerClient(STORAGE_ACCOUNT_CONNECTIONSTRING, STORAGE_ACCOUNT_CONNECTIONSTRING + "/" + INPUT_FILE_NAME);
+
+            var inputFileSasUri = GetInputFileUrl(inputcontainer, INPUT_FILE_NAME);
+
+
+            // Import this file
+            NotificationHubClient client = NotificationHubClient.CreateClientFromConnectionString(CONNECTION_STRING, HUB_NAME);
+            var job = await client.SubmitNotificationHubJobAsync(
+                new NotificationHubJob
+                {
+                    JobType = NotificationHubJobType.ImportCreateRegistrations,
+                    OutputContainerUri = outputContainerSasUri,
+                    ImportFileUri = inputFileSasUri
+                }
+            );
+
+            long i = 10;
+            while (i > 0 && job.Status != NotificationHubJobStatus.Completed)
+            {
+                job = await client.GetNotificationHubJobAsync(job.JobId);
+                await Task.Delay(1000);
+                i--;
+            }
+
+            return Ok(" completed successfully.");
+        }
+        static Uri GetOutputDirectoryUrl(BlobContainerClient container)
+        {
+            Console.WriteLine(container.CanGenerateSasUri);
+            BlobSasBuilder builder = new BlobSasBuilder(BlobSasPermissions.All, DateTime.UtcNow.AddDays(1));
+            return container.GenerateSasUri(builder);
+        }
+
+        static Uri GetInputFileUrl(BlobContainerClient container, string filePath)
+        {
+            Console.WriteLine(container.CanGenerateSasUri);
+            BlobSasBuilder builder = new BlobSasBuilder(BlobSasPermissions.Read, DateTime.UtcNow.AddDays(1));
+            return container.GenerateSasUri(builder);
+
+        }
+        private static async Task SerializeToBlobAsync(BlobContainerClient container, RegistrationDescription[] descriptions,string INPUT_FILE_NAME)
+        {
+            StringBuilder builder = new StringBuilder();
+            foreach (var registrationDescription in descriptions)
+            {
+                builder.AppendLine(registrationDescription.Serialize());
+            }
  
-   
-            await ExportData(NotificationHubConnectionString, HUB_NAME, STORAGE_ACCOUNT_CONNECTIONSTRING, CONTAINER_NAME);
-            return Ok("1");
+            var inputBlob = container.GetBlobClient(INPUT_FILE_NAME);
+            using (MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(builder.ToString())))
+            {
+                await inputBlob.UploadAsync(stream);
+            }
         }
 
-
-        static async Task ExportData(string connectionString, string hubName, string storageAccountConnectionString, string containerName)
+        [HttpPost("import")]
+        public async Task<IActionResult> ImportData()
         {
+            var connectionString = _configuration["Azure:NotificationHubConnectionString"];
+            var hubName = _configuration["Azure:NotificationHubName"];
+            var storageAccountConnectionString = _configuration["Azure:STORAGE_ACCOUNT_CONNECTIONSTRING"];
+            var containerName = _configuration["Azure:CONTAINER_NAME"];
+            var fileName = _configuration["LastExportedFileName"];
+
+            if (string.IsNullOrEmpty(fileName))
+            {
+                _logger.Log("No exported file name found to import.");
+                return BadRequest("No file name found to import.");
+            }
             try
             {
                 var container = new BlobContainerClient(storageAccountConnectionString, containerName);
                 await container.CreateIfNotExistsAsync();
+                _logger.Log("Checked container existence.");
 
+                var blobClient = container.GetBlobClient(fileName);
+                var readSasBuilder = new BlobSasBuilder(BlobSasPermissions.Write | BlobSasPermissions.List | BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddHours(1))
+                {
+                    StartsOn = DateTimeOffset.UtcNow.AddMinutes(-5)
+                };
+                var importBlobSasUri = blobClient.GenerateSasUri(readSasBuilder);
+                _logger.Log($"Generated read SAS URI: {importBlobSasUri}");
+
+                // Download the blob
+                var blobDownloadResponse = await blobClient.DownloadAsync();
+                using (var reader = new StreamReader(blobDownloadResponse.Value.Content, Encoding.UTF8, leaveOpen: false))
+                {
+                    var content = await reader.ReadToEndAsync();
+                    _logger.Log($"Read content from blob: {content.Substring(0, Math.Min(500, content.Length))}");
+                }
+
+                var writeSasBuilder = new BlobSasBuilder(BlobSasPermissions.Write | BlobSasPermissions.List | BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddHours(1))
+                {
+                    StartsOn = DateTimeOffset.UtcNow.AddMinutes(-5)
+                };
+                var outputContainerSasUri = container.GenerateSasUri(writeSasBuilder);
+                _logger.Log($"Generated write SAS URI: {outputContainerSasUri}");
+
+                var client = NotificationHubClient.CreateClientFromConnectionString(connectionString, hubName);
+                var job = new NotificationHubJob
+                {
+                    JobType = NotificationHubJobType.ImportCreateRegistrations,
+                    ImportFileUri = new Uri(importBlobSasUri.ToString()),
+                    OutputContainerUri = new Uri(outputContainerSasUri.ToString())
+                };
+
+                var response = await client.SubmitNotificationHubJobAsync(job);
+                _logger.Log("Submitted import job.");
+
+                NotificationHubJob updatedJob = null;
+                do
+                {
+                    await Task.Delay(1000);
+                    updatedJob = await client.GetNotificationHubJobAsync(response.JobId);
+                    _logger.Log($"Job Status: {updatedJob.Status} - {updatedJob.Progress}");
+                } while (updatedJob.Status == NotificationHubJobStatus.Running || updatedJob.Status == NotificationHubJobStatus.Started);
+
+                if (updatedJob.Status == NotificationHubJobStatus.Completed)
+                {
+                    _logger.Log("Import job completed successfully.");
+                    await _logger.SaveLogsAsync();  
+                    return Ok("Import completed successfully.");
+                }
+                else
+                {
+                    _logger.Log($"Import job failed: {updatedJob.Failure}");
+                    await _logger.SaveLogsAsync();  
+                    return StatusCode(StatusCodes.Status500InternalServerError, $"Import failed: {updatedJob.Failure}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Log($"An exception occurred: {ex.Message}");
+                await _logger.SaveLogsAsync();  
+                return StatusCode(StatusCodes.Status500InternalServerError, $"Server error: {ex.Message}");
+            }
+        }
+   
+         [HttpPost("export")]
+        public async Task<IActionResult> ExportData()
+        {
+            var connectionString = _configuration["Azure:NotificationHubConnectionString"];
+            var hubName = _configuration["Azure:NotificationHubName"];
+            var storageAccountConnectionString = _configuration["Azure:STORAGE_ACCOUNT_CONNECTIONSTRING"];
+            var containerName = _configuration["Azure:CONTAINER_NAME"];
+
+            try
+            {
+                var container = new BlobContainerClient(storageAccountConnectionString, containerName);
+                await container.CreateIfNotExistsAsync();
+                _logger.Log("Checked container existence.");
                 var builder = new BlobSasBuilder(BlobSasPermissions.Write | BlobSasPermissions.List | BlobSasPermissions.Read, DateTime.UtcNow.AddDays(1))
                 {
-                    StartsOn = DateTime.UtcNow.AddMinutes(-5)   
+                    StartsOn = DateTime.UtcNow.AddMinutes(-5)
                 };
                 var outputContainerSasUri = container.GenerateSasUri(builder);
-
-                Console.WriteLine($"Generated SAS URI: {outputContainerSasUri}");
-
+                _logger.Log($"Generated Write SAS URI: {outputContainerSasUri}");
+            
                 var client = NotificationHubClient.CreateClientFromConnectionString(connectionString, hubName);
                 var job = await client.SubmitNotificationHubJobAsync(
                     new NotificationHubJob
@@ -77,34 +224,40 @@ namespace AzureHubManagement.Controllers
                         OutputContainerUri = outputContainerSasUri
                     }
                 );
-
+                _logger.Log("Submitted Export job.");
                 // Monitor the job status
                 int attempt = 0;
                 while (true)
                 {
                     await Task.Delay(1000); // Poll every second
                     job = await client.GetNotificationHubJobAsync(job.JobId);
-                    Console.WriteLine($"Attempt {++attempt}: {job.Status} - {job.Progress}");
-
+                    _logger.Log($"Attempt {++attempt}: {job.Status} - {job.Progress}");
                     if (job.Status == NotificationHubJobStatus.Completed)
                     {
-                        Console.WriteLine($"Export completed, output file: {job.OutputFileName}");
-                        break;
+                        _logger.Log($"Export completed, output file: {job.OutputFileName}");
+                        _configuration["LastExportedFileName"] = job.OutputFileName;  
+          
+                        await _logger.SaveLogsAsync();
+                        return Ok("Export completed successfully.");
                     }
                     else if (job.Status == NotificationHubJobStatus.Failed)
                     {
-                        Console.WriteLine($"Job failed: {job.Failure}");
-                        break;
+                        _logger.Log($"Job failed: {job.Failure}");
+                        await _logger.SaveLogsAsync();
+                        return StatusCode(StatusCodes.Status500InternalServerError, $"Export failed: {job.Failure}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"An exception occurred: {ex.Message}");
-                throw;
+                _logger.Log($"An exception occurred: {ex.Message}");
+                await _logger.SaveLogsAsync();
+                return StatusCode(StatusCodes.Status500InternalServerError, $"Server error: {ex.Message}");
             }
         }
 
+
+      
 
         [HttpPost("create-installation")]
         public async Task<IActionResult> CreateOrUpdateInstallation([FromBody] Installation installation)
